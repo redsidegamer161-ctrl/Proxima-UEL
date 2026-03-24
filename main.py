@@ -68,30 +68,6 @@ c.execute("""CREATE TABLE IF NOT EXISTS player_stats (
              demands INTEGER DEFAULT 0
              )""")
 
-# 5. Loans Table
-c.execute("""CREATE TABLE IF NOT EXISTS loans (
-             loan_id INTEGER PRIMARY KEY AUTOINCREMENT,
-             user_id INTEGER,
-             from_team_id INTEGER,
-             to_team_id INTEGER,
-             start_time TEXT,
-             end_time TEXT,
-             guild_id INTEGER,
-             loaned_by_id INTEGER
-             )""")
-
-# 6. Loan Cooldown (last loan end time)
-c.execute("""CREATE TABLE IF NOT EXISTS loan_cooldown (
-             user_id INTEGER PRIMARY KEY,
-             last_loan_end TEXT
-             )""")
-
-# 7. Team Loan Limits (concurrent loans)
-c.execute("""CREATE TABLE IF NOT EXISTS team_loan_limits (
-             team_role_id INTEGER PRIMARY KEY,
-             loan_limit INTEGER DEFAULT 1
-             )""")
-
 # --- DATABASE MIGRATIONS ---
 try:
     c.execute("ALTER TABLE global_config ADD COLUMN free_agent_role_id INTEGER")
@@ -107,15 +83,6 @@ except sqlite3.OperationalError:
     pass
 try:
     c.execute("ALTER TABLE global_config ADD COLUMN demand_limit INTEGER DEFAULT 3")
-except sqlite3.OperationalError:
-    pass
-# Loan table migrations
-try:
-    c.execute("ALTER TABLE loans ADD COLUMN guild_id INTEGER")
-except sqlite3.OperationalError:
-    pass
-try:
-    c.execute("ALTER TABLE loans ADD COLUMN loaned_by_id INTEGER")
 except sqlite3.OperationalError:
     pass
 conn.commit()
@@ -208,74 +175,6 @@ def format_roster_list(members, mgr_id, asst_id):
             name += " **(AM)**"
         formatted_list.append(name)
     return formatted_list
-
-# --- LOAN HELPER FUNCTIONS ---
-def get_team_loan_limit(team_role_id):
-    c.execute("SELECT loan_limit FROM team_loan_limits WHERE team_role_id = ?", (team_role_id,))
-    row = c.fetchone()
-    return row[0] if row else 1
-
-def set_team_loan_limit(team_role_id, limit):
-    c.execute("INSERT OR REPLACE INTO team_loan_limits (team_role_id, loan_limit) VALUES (?, ?)",
-              (team_role_id, limit))
-    conn.commit()
-
-def get_active_loans_for_team(team_role_id):
-    c.execute("SELECT COUNT(*) FROM loans WHERE from_team_id = ? AND end_time > ?",
-              (team_role_id, datetime.datetime.now().isoformat()))
-    return c.fetchone()[0]
-
-def is_player_on_loan(user_id):
-    now = datetime.datetime.now().isoformat()
-    c.execute("SELECT 1 FROM loans WHERE user_id = ? AND end_time > ?", (user_id, now))
-    return c.fetchone() is not None
-
-def is_player_in_cooldown(user_id):
-    c.execute("SELECT last_loan_end FROM loan_cooldown WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    if not row:
-        return False
-    last_end = datetime.datetime.fromisoformat(row[0])
-    return (datetime.datetime.now() - last_end).total_seconds() < 86400  # 24 hours
-
-def end_loan(loan_id):
-    c.execute("SELECT user_id, from_team_id, to_team_id FROM loans WHERE loan_id = ?", (loan_id,))
-    row = c.fetchone()
-    if not row:
-        return None
-    user_id, from_team_id, to_team_id = row
-    c.execute("DELETE FROM loans WHERE loan_id = ?", (loan_id,))
-    c.execute("INSERT OR REPLACE INTO loan_cooldown (user_id, last_loan_end) VALUES (?, ?)",
-              (user_id, datetime.datetime.now().isoformat()))
-    conn.commit()
-    return (user_id, from_team_id, to_team_id)
-
-# --- BACKGROUND LOAN CHECKER (with delays) ---
-async def check_loans(client):
-    await client.wait_until_ready()
-    while not client.is_closed():
-        try:
-            now = datetime.datetime.now()
-            c.execute("SELECT loan_id, user_id, from_team_id, to_team_id, guild_id FROM loans WHERE end_time <= ?", (now.isoformat(),))
-            expired = c.fetchall()
-            for loan_id, user_id, from_team_id, to_team_id, guild_id in expired:
-                guild = client.get_guild(guild_id)
-                if not guild:
-                    continue
-                member = guild.get_member(user_id)
-                if member:
-                    from_role = guild.get_role(from_team_id)
-                    to_role = guild.get_role(to_team_id)
-                    if to_role and to_role in member.roles:
-                        await member.remove_roles(to_role)
-                    if from_role:
-                        await member.add_roles(from_role)
-                end_loan(loan_id)
-                # Small delay between loans to avoid rate limits
-                await asyncio.sleep(0.5)
-        except Exception as e:
-            print(f"Loan checker error: {e}")
-        await asyncio.sleep(60)
 
 # --- MASTER CARD GENERATOR ---
 async def generate_transaction_card(player, team_name, team_color, title_text="OFFICIAL SIGNING", custom_bg_url=None):
@@ -434,79 +333,6 @@ class TransferView(discord.ui.View):
             child.disabled = True
         await interaction.message.edit(content="❌ **Transfer Declined.**", view=self)
 
-class LoanConfirmView(discord.ui.View):
-    def __init__(self, guild, player, from_team, to_team, from_manager, duration_seconds=10800):
-        super().__init__(timeout=86400)
-        self.guild = guild
-        self.player = player
-        self.from_team = from_team
-        self.to_team = to_team
-        self.from_manager = from_manager
-        self.duration_seconds = duration_seconds
-
-    @discord.ui.button(label="Accept Loan", style=discord.ButtonStyle.green, emoji="✅")
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_window_open(self.guild.id):
-            return await interaction.response.send_message("❌ **Transfer Window is CLOSED.**", ephemeral=True)
-
-        await interaction.response.defer()
-
-        try:
-            member = self.guild.get_member(self.player.id)
-            if not member:
-                return await interaction.followup.send("❌ Player missing.", ephemeral=True)
-
-            if is_player_on_loan(member.id):
-                return await interaction.followup.send("❌ Player is already on loan.", ephemeral=True)
-            if is_player_in_cooldown(member.id):
-                return await interaction.followup.send("❌ Player is still in cooldown (24h after last loan).", ephemeral=True)
-
-            limit = get_team_loan_limit(self.from_team.id)
-            active = get_active_loans_for_team(self.from_team.id)
-            if active >= limit:
-                return await interaction.followup.send(f"❌ Your team already has {active}/{limit} active loans.", ephemeral=True)
-
-            await member.remove_roles(self.from_team)
-            await member.add_roles(self.to_team)
-
-            start = datetime.datetime.now()
-            end = start + datetime.timedelta(seconds=self.duration_seconds)
-            c.execute("INSERT INTO loans (user_id, from_team_id, to_team_id, start_time, end_time, guild_id, loaned_by_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                      (member.id, self.from_team.id, self.to_team.id, start.isoformat(), end.isoformat(), self.guild.id, self.from_manager.id))
-            conn.commit()
-
-            try:
-                await member.send(f"📝 **You have been loaned by {self.from_team.name} to {self.to_team.name}** for 3 hours in **{self.guild.name}**.")
-            except:
-                pass
-
-            embed = discord.Embed(
-                title="Loan Agreement",
-                description=f"{member.mention} has been loaned from {self.from_team.mention} to {self.to_team.mention} for 3 hours.",
-                color=discord.Color.green(),
-                timestamp=datetime.datetime.now()
-            )
-            embed.set_footer(text=f"Loaned by {self.from_manager.display_name}")
-            await send_to_channel(self.guild, embed)
-
-            await interaction.followup.send(f"✅ Loan confirmed! {member.name} will return after 3 hours.")
-            self.stop()
-            for child in self.children:
-                child.disabled = True
-            await interaction.message.edit(content="✅ **Loan Accepted.**", view=self)
-
-        except Exception as e:
-            await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
-
-    @discord.ui.button(label="Decline", style=discord.ButtonStyle.red, emoji="❌")
-    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer()
-        await send_dm(self.from_manager, f"❌ Loan for **{self.player.name}** to **{self.to_team.name}** was DECLINED.")
-        self.stop()
-        for child in self.children:
-            child.disabled = True
-        await interaction.message.edit(content="❌ **Loan Declined.**", view=self)
-
 class HelpView(discord.ui.View):
     def __init__(self, embeds):
         super().__init__(timeout=60)
@@ -553,7 +379,6 @@ class LeagueBot(discord.Client):
 
     async def on_ready(self):
         await self.tree.sync()
-        self.loop.create_task(check_loans(self))
         print(f"✅ LOGGED IN AS: {self.user}")
 
 client = LeagueBot()
@@ -602,8 +427,6 @@ async def help_command(interaction: discord.Interaction):
     embed2.add_field(name="/promote [player]", value="Promote player to Assistant Manager", inline=False)
     embed2.add_field(name="/tm_transfer [player]", value="Transfer Team Ownership to a player", inline=False)
     embed2.add_field(name="/decorate_transactions", value="Set custom transaction card background", inline=False)
-    embed2.add_field(name="/loan [player] [team]", value="Loan a player from your team to another (3h)", inline=False)
-    embed2.add_field(name="/loan_cancel [player]", value="Cancel a loan you initiated", inline=False)
 
     embed3 = discord.Embed(title="Help - Admin Commands (Page 3/3)", color=discord.Color.red())
     embed3.add_field(name="/setup_global", value="Configure bot roles/channels", inline=False)
@@ -612,7 +435,6 @@ async def help_command(interaction: discord.Interaction):
     embed3.add_field(name="/window", value="Open/Close transfer window", inline=False)
     embed3.add_field(name="/reset_config", value="Wipe server configuration", inline=False)
     embed3.add_field(name="/transfer_list", value="View top transfers leaderboard", inline=False)
-    embed3.add_field(name="/loan_limit [team] [limit]", value="Set max concurrent loans for a team", inline=False)
 
     view = HelpView([embed1, embed2, embed3])
     await interaction.response.send_message(embed=embed1, view=view, ephemeral=True)
@@ -978,116 +800,6 @@ async def test_card(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {e}")
 
-# --- NEW LOAN COMMANDS ---
-
-@client.tree.command(name="loan", description="Loan a player from your team to another team (3 hours).")
-@cooldown(1, 5)
-async def loan(interaction: discord.Interaction, player: discord.Member, target_team: discord.Role):
-    # Check if user is manager/assistant
-    g_config = get_global_config(interaction.guild.id)
-    if not g_config:
-        return await interaction.response.send_message("❌ Bot not configured. Run `/setup_global`.", ephemeral=True)
-    mgr_role = interaction.guild.get_role(g_config[1])
-    asst_role = interaction.guild.get_role(g_config[2])
-    if not (mgr_role in interaction.user.roles or asst_role in interaction.user.roles):
-        return await interaction.response.send_message("❌ You must be a Team Manager or Assistant Manager.", ephemeral=True)
-
-    # Find the team of the user
-    team_info = find_user_team(interaction.user)
-    if not team_info:
-        return await interaction.response.send_message("❌ You are not on any team.", ephemeral=True)
-    from_team = team_info[0]
-
-    # Validate target team is registered
-    if not get_team_data(target_team.id):
-        return await interaction.response.send_message("❌ Target team is not registered.", ephemeral=True)
-    if from_team.id == target_team.id:
-        return await interaction.response.send_message("❌ Cannot loan to your own team.", ephemeral=True)
-
-    # Check if player is on your team
-    if from_team not in player.roles:
-        return await interaction.response.send_message("❌ That player is not on your team.", ephemeral=True)
-
-    # Check if player is already on loan or in cooldown
-    if is_player_on_loan(player.id):
-        return await interaction.response.send_message("❌ That player is already on loan.", ephemeral=True)
-    if is_player_in_cooldown(player.id):
-        return await interaction.response.send_message("❌ That player is still in cooldown (24h after last loan).", ephemeral=True)
-
-    # Check loan limit for source team
-    limit = get_team_loan_limit(from_team.id)
-    active = get_active_loans_for_team(from_team.id)
-    if active >= limit:
-        return await interaction.response.send_message(f"❌ Your team already has {active}/{limit} active loans.", ephemeral=True)
-
-    # Send confirmation to target team's managers
-    heads, assts = get_managers_of_team(interaction.guild, target_team)
-    target_manager = heads[0] if heads else (assts[0] if assts else None)
-    if not target_manager:
-        return await interaction.response.send_message(f"❌ **{target_team.name}** has no active Manager.", ephemeral=True)
-
-    view = LoanConfirmView(interaction.guild, player, from_team, target_team, interaction.user)
-    dm_embed = discord.Embed(title="Loan Offer 📝", color=discord.Color.gold())
-    dm_embed.description = f"**{interaction.user.mention}** wants to loan **{player.name}** to your team for 3 hours.\nDo you accept?"
-
-    if await send_dm(target_manager, embed=dm_embed, view=view):
-        await interaction.response.send_message(f"✅ **Loan offer sent!** Waiting for {target_manager.mention}.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"❌ Could not DM the manager of {target_team.name}.", ephemeral=True)
-
-@client.tree.command(name="loan_cancel", description="Cancel a loan you initiated.")
-@cooldown(1, 5)
-async def loan_cancel(interaction: discord.Interaction, player: discord.Member):
-    # Check manager/assistant
-    g_config = get_global_config(interaction.guild.id)
-    if not g_config:
-        return await interaction.response.send_message("❌ Bot not configured.", ephemeral=True)
-    mgr_role = interaction.guild.get_role(g_config[1])
-    asst_role = interaction.guild.get_role(g_config[2])
-    if not (mgr_role in interaction.user.roles or asst_role in interaction.user.roles):
-        return await interaction.response.send_message("❌ You must be a Team Manager or Assistant Manager.", ephemeral=True)
-
-    # Find active loan for this player
-    c.execute("SELECT loan_id, from_team_id, to_team_id FROM loans WHERE user_id = ? AND end_time > ?",
-              (player.id, datetime.datetime.now().isoformat()))
-    row = c.fetchone()
-    if not row:
-        return await interaction.response.send_message("❌ That player is not currently on loan.", ephemeral=True)
-    loan_id, from_team_id, to_team_id = row
-
-    # Check if the user is from the same team that initiated the loan
-    user_team = find_user_team(interaction.user)
-    if not user_team or user_team[0].id != from_team_id:
-        return await interaction.response.send_message("❌ You can only cancel loans that originated from your team.", ephemeral=True)
-
-    # Cancel the loan
-    result = end_loan(loan_id)
-    if result:
-        user_id, from_id, to_id = result
-        member = interaction.guild.get_member(user_id)
-        if member:
-            from_role = interaction.guild.get_role(from_id)
-            to_role = interaction.guild.get_role(to_id)
-            if to_role and to_role in member.roles:
-                await member.remove_roles(to_role)
-            if from_role:
-                await member.add_roles(from_role)
-        await interaction.response.send_message(f"✅ Loan for {player.mention} has been cancelled. Player returned to your team.")
-    else:
-        await interaction.response.send_message("❌ Could not cancel loan.", ephemeral=True)
-
-@client.tree.command(name="loan_limit", description="[Admin] Set max concurrent loans for a team.")
-@cooldown(1, 5)
-async def loan_limit(interaction: discord.Interaction, team: discord.Role, limit: int = 1):
-    if not is_staff(interaction):
-        return await interaction.response.send_message("❌ Admin only.", ephemeral=True)
-    if limit < 0:
-        return await interaction.response.send_message("❌ Limit must be 0 or positive.", ephemeral=True)
-    if not get_team_data(team.id):
-        return await interaction.response.send_message("❌ That team is not registered.", ephemeral=True)
-    set_team_loan_limit(team.id, limit)
-    await interaction.response.send_message(f"✅ Loan limit for **{team.name}** set to {limit}.", ephemeral=True)
-
 # --- ERROR HANDLER ---
 @client.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -1104,7 +816,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             pass
 
 # --- STARTUP ---
-print("System: Loading Proxima V17 (Loan System with cooldowns)...")
+print("System: Loading Proxima V17 (without loan system)...")
 if TOKEN:
     try:
         keep_alive()
