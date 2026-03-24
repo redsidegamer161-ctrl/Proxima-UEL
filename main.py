@@ -4,7 +4,6 @@ import sqlite3
 import datetime
 import os
 import asyncio
-import functools
 from keep_alive import keep_alive
 
 # --- IMPORTS FOR IMAGE GENERATION ---
@@ -30,290 +29,141 @@ def check_and_download_font():
 
 check_and_download_font()
 
-# --- DATABASE HELPER (non-blocking) ---
-def run_db(func, *args, **kwargs):
-    """Run a database function in a thread pool with a fresh connection."""
-    async def wrapper():
-        loop = asyncio.get_running_loop()
-        # Use functools.partial to pass the function and its arguments
-        return await loop.run_in_executor(
-            None,
-            lambda: db_worker(func, *args, **kwargs)
-        )
-    return wrapper
+# --- DATABASE SETUP ---
+conn = sqlite3.connect('team_manager.db')
+c = conn.cursor()
 
-def db_worker(func, *args, **kwargs):
-    """Worker that creates a new connection, runs the query, and closes it."""
-    conn = sqlite3.connect('team_manager.db')
-    c = conn.cursor()
-    try:
-        result = func(c, *args, **kwargs)
-        conn.commit()
-        return result
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        conn.close()
+# 1. Global Settings
+c.execute("""CREATE TABLE IF NOT EXISTS global_config (
+             guild_id INTEGER PRIMARY KEY,
+             manager_role_id INTEGER,
+             asst_role_id INTEGER,
+             contract_channel_id INTEGER,
+             free_agent_role_id INTEGER,
+             window_open INTEGER DEFAULT 1,
+             demand_limit INTEGER DEFAULT 3
+             )""")
 
-# --- DATABASE QUERY FUNCTIONS (synchronous, expecting cursor as first argument) ---
-def init_db(c):
-    # Create tables if not exist
-    c.execute("""CREATE TABLE IF NOT EXISTS global_config (
-                 guild_id INTEGER PRIMARY KEY,
-                 manager_role_id INTEGER,
-                 asst_role_id INTEGER,
-                 contract_channel_id INTEGER,
-                 free_agent_role_id INTEGER,
-                 window_open INTEGER DEFAULT 1,
-                 demand_limit INTEGER DEFAULT 3
-                 )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS teams (
-                 team_role_id INTEGER PRIMARY KEY,
-                 logo TEXT,
-                 roster_limit INTEGER,
-                 transaction_image TEXT
-                 )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS free_agents (
-                 user_id INTEGER PRIMARY KEY,
-                 region TEXT,
-                 position TEXT,
-                 description TEXT,
-                 timestamp TEXT
-                 )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS player_stats (
-                 user_id INTEGER PRIMARY KEY,
-                 transfers INTEGER DEFAULT 0,
-                 demands INTEGER DEFAULT 0
-                 )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS loans (
-                 loan_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 user_id INTEGER,
-                 from_team_id INTEGER,
-                 to_team_id INTEGER,
-                 start_time TEXT,
-                 end_time TEXT,
-                 guild_id INTEGER,
-                 loaned_by_id INTEGER
-                 )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS loan_cooldown (
-                 user_id INTEGER PRIMARY KEY,
-                 last_loan_end TEXT
-                 )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS team_loan_limits (
-                 team_role_id INTEGER PRIMARY KEY,
-                 loan_limit INTEGER DEFAULT 1
-                 )""")
-    # Migrations
-    for col in ["free_agent_role_id", "window_open", "demand_limit"]:
-        try:
-            c.execute(f"ALTER TABLE global_config ADD COLUMN {col} INTEGER")
-        except sqlite3.OperationalError:
-            pass
-    try:
-        c.execute("ALTER TABLE teams ADD COLUMN transaction_image TEXT")
-    except:
-        pass
-    try:
-        c.execute("ALTER TABLE loans ADD COLUMN guild_id INTEGER")
-    except:
-        pass
-    try:
-        c.execute("ALTER TABLE loans ADD COLUMN loaned_by_id INTEGER")
-    except:
-        pass
-    return True
+# 2. Teams Table
+c.execute("""CREATE TABLE IF NOT EXISTS teams (
+             team_role_id INTEGER PRIMARY KEY,
+             logo TEXT,
+             roster_limit INTEGER,
+             transaction_image TEXT
+             )""")
 
-def get_global_config(c, guild_id):
+# 3. Free Agents
+c.execute("""CREATE TABLE IF NOT EXISTS free_agents (
+             user_id INTEGER PRIMARY KEY,
+             region TEXT,
+             position TEXT,
+             description TEXT,
+             timestamp TEXT
+             )""")
+
+# 4. Player Stats
+c.execute("""CREATE TABLE IF NOT EXISTS player_stats (
+             user_id INTEGER PRIMARY KEY,
+             transfers INTEGER DEFAULT 0,
+             demands INTEGER DEFAULT 0
+             )""")
+
+# 5. Loans Table
+c.execute("""CREATE TABLE IF NOT EXISTS loans (
+             loan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+             user_id INTEGER,
+             from_team_id INTEGER,
+             to_team_id INTEGER,
+             start_time TEXT,
+             end_time TEXT,
+             guild_id INTEGER,
+             loaned_by_id INTEGER
+             )""")
+
+# 6. Loan Cooldown (last loan end time)
+c.execute("""CREATE TABLE IF NOT EXISTS loan_cooldown (
+             user_id INTEGER PRIMARY KEY,
+             last_loan_end TEXT
+             )""")
+
+# 7. Team Loan Limits (concurrent loans)
+c.execute("""CREATE TABLE IF NOT EXISTS team_loan_limits (
+             team_role_id INTEGER PRIMARY KEY,
+             loan_limit INTEGER DEFAULT 1
+             )""")
+
+# --- DATABASE MIGRATIONS ---
+try:
+    c.execute("ALTER TABLE global_config ADD COLUMN free_agent_role_id INTEGER")
+except sqlite3.OperationalError:
+    pass
+try:
+    c.execute("ALTER TABLE global_config ADD COLUMN window_open INTEGER DEFAULT 1")
+except sqlite3.OperationalError:
+    pass
+try:
+    c.execute("ALTER TABLE teams ADD COLUMN transaction_image TEXT")
+except sqlite3.OperationalError:
+    pass
+try:
+    c.execute("ALTER TABLE global_config ADD COLUMN demand_limit INTEGER DEFAULT 3")
+except sqlite3.OperationalError:
+    pass
+# Loan table migrations
+try:
+    c.execute("ALTER TABLE loans ADD COLUMN guild_id INTEGER")
+except sqlite3.OperationalError:
+    pass
+try:
+    c.execute("ALTER TABLE loans ADD COLUMN loaned_by_id INTEGER")
+except sqlite3.OperationalError:
+    pass
+conn.commit()
+
+# --- HELPER FUNCTIONS ---
+
+def get_global_config(guild_id):
     c.execute("SELECT * FROM global_config WHERE guild_id = ?", (guild_id,))
     return c.fetchone()
 
-def get_team_data(c, role_id):
+def get_team_data(role_id):
     c.execute("SELECT * FROM teams WHERE team_role_id = ?", (role_id,))
     return c.fetchone()
 
-def get_all_teams(c):
+def get_all_teams():
     c.execute("SELECT * FROM teams")
     return c.fetchall()
 
-def get_player_stats(c, user_id):
+def get_player_stats(user_id):
     c.execute("SELECT * FROM player_stats WHERE user_id = ?", (user_id,))
     data = c.fetchone()
     if not data:
         c.execute("INSERT INTO player_stats (user_id, transfers, demands) VALUES (?, 0, 0)", (user_id,))
+        conn.commit()
         return (user_id, 0, 0)
     return data
 
-def update_stat(c, user_id, stat_type, amount=1):
-    get_player_stats(c, user_id)
+def update_stat(user_id, stat_type, amount=1):
+    get_player_stats(user_id)
     if stat_type == "transfer":
         c.execute("UPDATE player_stats SET transfers = transfers + ? WHERE user_id = ?", (amount, user_id))
     elif stat_type == "demand":
         c.execute("UPDATE player_stats SET demands = demands + ? WHERE user_id = ?", (amount, user_id))
+    conn.commit()
 
-def delete_free_agent(c, user_id):
-    c.execute("DELETE FROM free_agents WHERE user_id = ?", (user_id,))
+def find_user_team(member):
+    for role in member.roles:
+        data = get_team_data(role.id)
+        if data:
+            trans_img = data[3] if len(data) > 3 else None
+            return (role, data[1], data[2], trans_img)
+    return None
 
-def insert_free_agent(c, user_id, region, position, description):
-    c.execute("INSERT OR REPLACE INTO free_agents VALUES (?, ?, ?, ?, ?)",
-              (user_id, region, position, description, datetime.datetime.now().isoformat()))
-
-def get_free_agents(c):
-    c.execute("SELECT * FROM free_agents")
-    return c.fetchall()
-
-def set_global_config(c, guild_id, manager_id, asst_id, channel_id, fa_role_id, window_state, demand_limit):
-    c.execute("INSERT OR REPLACE INTO global_config VALUES (?, ?, ?, ?, ?, ?, ?)",
-              (guild_id, manager_id, asst_id, channel_id, fa_role_id, window_state, demand_limit))
-
-def update_window(c, guild_id, status):
-    c.execute("UPDATE global_config SET window_open = ? WHERE guild_id = ?", (status, guild_id))
-
-def insert_team(c, team_role_id, logo, roster_limit, trans_img):
-    c.execute("INSERT OR REPLACE INTO teams VALUES (?, ?, ?, ?)", (team_role_id, logo, roster_limit, trans_img))
-
-def delete_team(c, team_role_id):
-    c.execute("DELETE FROM teams WHERE team_role_id = ?", (team_role_id,))
-
-def update_team_transaction_image(c, team_role_id, image_url):
-    c.execute("UPDATE teams SET transaction_image = ? WHERE team_role_id = ?", (image_url, team_role_id))
-
-def get_team_loan_limit(c, team_role_id):
-    c.execute("SELECT loan_limit FROM team_loan_limits WHERE team_role_id = ?", (team_role_id,))
-    row = c.fetchone()
-    return row[0] if row else 1
-
-def set_team_loan_limit(c, team_role_id, limit):
-    c.execute("INSERT OR REPLACE INTO team_loan_limits (team_role_id, loan_limit) VALUES (?, ?)",
-              (team_role_id, limit))
-
-def get_active_loans_for_team(c, team_role_id):
-    c.execute("SELECT COUNT(*) FROM loans WHERE from_team_id = ? AND end_time > ?",
-              (team_role_id, datetime.datetime.now().isoformat()))
-    return c.fetchone()[0]
-
-def is_player_on_loan(c, user_id):
-    c.execute("SELECT 1 FROM loans WHERE user_id = ? AND end_time > ?",
-              (user_id, datetime.datetime.now().isoformat()))
-    return c.fetchone() is not None
-
-def is_player_in_cooldown(c, user_id):
-    c.execute("SELECT last_loan_end FROM loan_cooldown WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    if not row:
-        return False
-    last_end = datetime.datetime.fromisoformat(row[0])
-    return (datetime.datetime.now() - last_end).total_seconds() < 86400
-
-def add_loan(c, user_id, from_team_id, to_team_id, start, end, guild_id, loaned_by_id):
-    c.execute("INSERT INTO loans (user_id, from_team_id, to_team_id, start_time, end_time, guild_id, loaned_by_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-              (user_id, from_team_id, to_team_id, start.isoformat(), end.isoformat(), guild_id, loaned_by_id))
-
-def get_expired_loans(c):
-    c.execute("SELECT loan_id, user_id, from_team_id, to_team_id, guild_id FROM loans WHERE end_time <= ?",
-              (datetime.datetime.now().isoformat(),))
-    return c.fetchall()
-
-def end_loan(c, loan_id):
-    c.execute("SELECT user_id, from_team_id, to_team_id FROM loans WHERE loan_id = ?", (loan_id,))
-    row = c.fetchone()
-    if not row:
-        return None
-    user_id, from_team_id, to_team_id = row
-    c.execute("DELETE FROM loans WHERE loan_id = ?", (loan_id,))
-    c.execute("INSERT OR REPLACE INTO loan_cooldown (user_id, last_loan_end) VALUES (?, ?)",
-              (user_id, datetime.datetime.now().isoformat()))
-    return (user_id, from_team_id, to_team_id)
-
-def get_active_loan(c, user_id):
-    c.execute("SELECT loan_id, from_team_id, to_team_id FROM loans WHERE user_id = ? AND end_time > ?",
-              (user_id, datetime.datetime.now().isoformat()))
-    return c.fetchone()
-
-def get_top_transfers(c):
-    c.execute("SELECT user_id, transfers FROM player_stats ORDER BY transfers DESC LIMIT 15")
-    return c.fetchall()
-
-# --- INITIALIZE DATABASE (run once) ---
-async def init_db_async():
-    await run_db(init_db)()
-
-# --- HELPER FUNCTIONS (now use async wrappers) ---
-async def get_global_config_async(guild_id):
-    return await run_db(get_global_config, guild_id)()
-
-async def get_team_data_async(role_id):
-    return await run_db(get_team_data, role_id)()
-
-async def get_all_teams_async():
-    return await run_db(get_all_teams)()
-
-async def get_player_stats_async(user_id):
-    return await run_db(get_player_stats, user_id)()
-
-async def update_stat_async(user_id, stat_type, amount=1):
-    await run_db(update_stat, user_id, stat_type, amount)()
-
-async def delete_free_agent_async(user_id):
-    await run_db(delete_free_agent, user_id)()
-
-async def insert_free_agent_async(user_id, region, position, description):
-    await run_db(insert_free_agent, user_id, region, position, description)()
-
-async def get_free_agents_async():
-    return await run_db(get_free_agents)()
-
-async def set_global_config_async(guild_id, manager_id, asst_id, channel_id, fa_role_id, window_state, demand_limit):
-    await run_db(set_global_config, guild_id, manager_id, asst_id, channel_id, fa_role_id, window_state, demand_limit)()
-
-async def update_window_async(guild_id, status):
-    await run_db(update_window, guild_id, status)()
-
-async def insert_team_async(team_role_id, logo, roster_limit, trans_img):
-    await run_db(insert_team, team_role_id, logo, roster_limit, trans_img)()
-
-async def delete_team_async(team_role_id):
-    await run_db(delete_team, team_role_id)()
-
-async def update_team_transaction_image_async(team_role_id, image_url):
-    await run_db(update_team_transaction_image, team_role_id, image_url)()
-
-async def get_team_loan_limit_async(team_role_id):
-    return await run_db(get_team_loan_limit, team_role_id)()
-
-async def set_team_loan_limit_async(team_role_id, limit):
-    await run_db(set_team_loan_limit, team_role_id, limit)()
-
-async def get_active_loans_for_team_async(team_role_id):
-    return await run_db(get_active_loans_for_team, team_role_id)()
-
-async def is_player_on_loan_async(user_id):
-    return await run_db(is_player_on_loan, user_id)()
-
-async def is_player_in_cooldown_async(user_id):
-    return await run_db(is_player_in_cooldown, user_id)()
-
-async def add_loan_async(user_id, from_team_id, to_team_id, start, end, guild_id, loaned_by_id):
-    await run_db(add_loan, user_id, from_team_id, to_team_id, start, end, guild_id, loaned_by_id)()
-
-async def get_expired_loans_async():
-    return await run_db(get_expired_loans)()
-
-async def end_loan_async(loan_id):
-    return await run_db(end_loan, loan_id)()
-
-async def get_active_loan_async(user_id):
-    return await run_db(get_active_loan, user_id)()
-
-async def get_top_transfers_async():
-    return await run_db(get_top_transfers)()
-
-# --- HELPER FUNCTIONS (non-database) ---
 def is_staff(interaction: discord.Interaction):
     return interaction.user.guild_permissions.administrator
 
-async def is_window_open_async(guild_id):
-    config = await get_global_config_async(guild_id)
+def is_window_open(guild_id):
+    config = get_global_config(guild_id)
     if not config:
         return True
     try:
@@ -321,23 +171,8 @@ async def is_window_open_async(guild_id):
     except IndexError:
         return True
 
-def find_user_team(member, teams_cache=None):
-    # We need to fetch team data for each role; this may be called from async context
-    # We'll make it async later; for now, keep synchronous but it's okay because it's called after role iteration
-    # However, to avoid blocking, we'll move to async.
-    pass
-
-# We'll rewrite find_user_team as async
-async def find_user_team_async(member):
-    for role in member.roles:
-        data = await get_team_data_async(role.id)
-        if data:
-            trans_img = data[3] if len(data) > 3 else None
-            return (role, data[1], data[2], trans_img)
-    return None
-
-async def get_managers_of_team_async(guild, team_role):
-    config = await get_global_config_async(guild.id)
+def get_managers_of_team(guild, team_role):
+    config = get_global_config(guild.id)
     if not config:
         return ([], [])
     mgr_id, asst_id = config[1], config[2]
@@ -350,9 +185,10 @@ async def get_managers_of_team_async(guild, team_role):
             assistants.append(member)
     return (head_managers, assistants)
 
-async def cleanup_free_agent_async(guild, member):
-    await delete_free_agent_async(member.id)
-    config = await get_global_config_async(guild.id)
+async def cleanup_free_agent(guild, member):
+    c.execute("DELETE FROM free_agents WHERE user_id = ?", (member.id,))
+    conn.commit()
+    config = get_global_config(guild.id)
     if config and config[4]:
         role = guild.get_role(config[4])
         if role and role in member.roles:
@@ -373,12 +209,55 @@ def format_roster_list(members, mgr_id, asst_id):
         formatted_list.append(name)
     return formatted_list
 
-# --- BACKGROUND LOAN CHECKER ---
+# --- LOAN HELPER FUNCTIONS ---
+def get_team_loan_limit(team_role_id):
+    c.execute("SELECT loan_limit FROM team_loan_limits WHERE team_role_id = ?", (team_role_id,))
+    row = c.fetchone()
+    return row[0] if row else 1
+
+def set_team_loan_limit(team_role_id, limit):
+    c.execute("INSERT OR REPLACE INTO team_loan_limits (team_role_id, loan_limit) VALUES (?, ?)",
+              (team_role_id, limit))
+    conn.commit()
+
+def get_active_loans_for_team(team_role_id):
+    c.execute("SELECT COUNT(*) FROM loans WHERE from_team_id = ? AND end_time > ?",
+              (team_role_id, datetime.datetime.now().isoformat()))
+    return c.fetchone()[0]
+
+def is_player_on_loan(user_id):
+    now = datetime.datetime.now().isoformat()
+    c.execute("SELECT 1 FROM loans WHERE user_id = ? AND end_time > ?", (user_id, now))
+    return c.fetchone() is not None
+
+def is_player_in_cooldown(user_id):
+    c.execute("SELECT last_loan_end FROM loan_cooldown WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    if not row:
+        return False
+    last_end = datetime.datetime.fromisoformat(row[0])
+    return (datetime.datetime.now() - last_end).total_seconds() < 86400  # 24 hours
+
+def end_loan(loan_id):
+    c.execute("SELECT user_id, from_team_id, to_team_id FROM loans WHERE loan_id = ?", (loan_id,))
+    row = c.fetchone()
+    if not row:
+        return None
+    user_id, from_team_id, to_team_id = row
+    c.execute("DELETE FROM loans WHERE loan_id = ?", (loan_id,))
+    c.execute("INSERT OR REPLACE INTO loan_cooldown (user_id, last_loan_end) VALUES (?, ?)",
+              (user_id, datetime.datetime.now().isoformat()))
+    conn.commit()
+    return (user_id, from_team_id, to_team_id)
+
+# --- BACKGROUND LOAN CHECKER (with delays) ---
 async def check_loans(client):
     await client.wait_until_ready()
     while not client.is_closed():
         try:
-            expired = await get_expired_loans_async()
+            now = datetime.datetime.now()
+            c.execute("SELECT loan_id, user_id, from_team_id, to_team_id, guild_id FROM loans WHERE end_time <= ?", (now.isoformat(),))
+            expired = c.fetchall()
             for loan_id, user_id, from_team_id, to_team_id, guild_id in expired:
                 guild = client.get_guild(guild_id)
                 if not guild:
@@ -391,10 +270,11 @@ async def check_loans(client):
                         await member.remove_roles(to_role)
                     if from_role:
                         await member.add_roles(from_role)
-                # Remove the loan record and add cooldown
-                await end_loan_async(loan_id)
+                end_loan(loan_id)
+                # Small delay between loans to avoid rate limits
+                await asyncio.sleep(0.5)
         except Exception as e:
-            print(f"Error in loan checker: {e}")
+            print(f"Loan checker error: {e}")
         await asyncio.sleep(60)
 
 # --- MASTER CARD GENERATOR ---
@@ -479,7 +359,7 @@ def create_transaction_embed(guild, title, description, color, team_role, logo, 
     return embed
 
 async def send_to_channel(guild, embed, file=None):
-    config = await get_global_config_async(guild.id)
+    config = get_global_config(guild.id)
     if config and config[3]:
         channel = guild.get_channel(config[3])
         if channel:
@@ -508,7 +388,7 @@ class TransferView(discord.ui.View):
 
     @discord.ui.button(label="Accept Transfer", style=discord.ButtonStyle.green, emoji="✅")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await is_window_open_async(self.guild.id):
+        if not is_window_open(self.guild.id):
             return await interaction.response.send_message("❌ **Transfer Window is CLOSED.**", ephemeral=True)
 
         await interaction.response.defer()
@@ -520,12 +400,12 @@ class TransferView(discord.ui.View):
 
             await member.remove_roles(self.from_team)
             await member.add_roles(self.to_team)
-            await cleanup_free_agent_async(self.guild, member)
-            await update_stat_async(member.id, "transfer")
+            await cleanup_free_agent(self.guild, member)
+            update_stat(member.id, "transfer")
 
             desc = f"🚨 **TRANSFER NEWS** 🚨\n\n{member.mention} has been transferred\nFrom: {self.from_team.mention}\nTo: {self.to_team.mention}"
 
-            data = await get_team_data_async(self.to_team.id)
+            data = get_team_data(self.to_team.id)
             limit = data[2] if data else 0
             custom_bg = data[3] if data and len(data) > 3 else None
 
@@ -566,7 +446,7 @@ class LoanConfirmView(discord.ui.View):
 
     @discord.ui.button(label="Accept Loan", style=discord.ButtonStyle.green, emoji="✅")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await is_window_open_async(self.guild.id):
+        if not is_window_open(self.guild.id):
             return await interaction.response.send_message("❌ **Transfer Window is CLOSED.**", ephemeral=True)
 
         await interaction.response.defer()
@@ -576,13 +456,13 @@ class LoanConfirmView(discord.ui.View):
             if not member:
                 return await interaction.followup.send("❌ Player missing.", ephemeral=True)
 
-            if await is_player_on_loan_async(member.id):
+            if is_player_on_loan(member.id):
                 return await interaction.followup.send("❌ Player is already on loan.", ephemeral=True)
-            if await is_player_in_cooldown_async(member.id):
+            if is_player_in_cooldown(member.id):
                 return await interaction.followup.send("❌ Player is still in cooldown (24h after last loan).", ephemeral=True)
 
-            limit = await get_team_loan_limit_async(self.from_team.id)
-            active = await get_active_loans_for_team_async(self.from_team.id)
+            limit = get_team_loan_limit(self.from_team.id)
+            active = get_active_loans_for_team(self.from_team.id)
             if active >= limit:
                 return await interaction.followup.send(f"❌ Your team already has {active}/{limit} active loans.", ephemeral=True)
 
@@ -591,7 +471,9 @@ class LoanConfirmView(discord.ui.View):
 
             start = datetime.datetime.now()
             end = start + datetime.timedelta(seconds=self.duration_seconds)
-            await add_loan_async(member.id, self.from_team.id, self.to_team.id, start, end, self.guild.id, self.from_manager.id)
+            c.execute("INSERT INTO loans (user_id, from_team_id, to_team_id, start_time, end_time, guild_id, loaned_by_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                      (member.id, self.from_team.id, self.to_team.id, start.isoformat(), end.isoformat(), self.guild.id, self.from_manager.id))
+            conn.commit()
 
             try:
                 await member.send(f"📝 **You have been loaned by {self.from_team.name} to {self.to_team.name}** for 3 hours in **{self.guild.name}**.")
@@ -655,8 +537,8 @@ class ResetView(discord.ui.View):
 
     @discord.ui.button(label="⚠️ CONFIRM WIPE", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Delete Config
-        await run_db(lambda c: c.execute("DELETE FROM global_config WHERE guild_id = ?", (self.guild_id,)))()
+        c.execute("DELETE FROM global_config WHERE guild_id = ?", (self.guild_id,))
+        conn.commit()
         await interaction.response.edit_message(content="✅ **Configuration Wiped.** Please run `/setup_global` again.", view=None, embed=None)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
@@ -670,15 +552,19 @@ class LeagueBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def on_ready(self):
-        await init_db_async()
         await self.tree.sync()
         self.loop.create_task(check_loans(self))
         print(f"✅ LOGGED IN AS: {self.user}")
 
 client = LeagueBot()
 
-# --- COMMANDS ---
+# --- COMMANDS (with cooldowns) ---
 
+# Helper to apply cooldown (5 seconds per user)
+def cooldown(rate=1, per=5):
+    return app_commands.checks.cooldown(rate, per)
+
+# Owner-only command – no cooldown needed
 @client.tree.command(name="leave_other_servers", description="[OWNER ONLY] Makes the bot leave all other servers.")
 async def leave_other_servers(interaction: discord.Interaction):
     OWNER_ID = 925817680848617486
@@ -701,6 +587,7 @@ async def leave_other_servers(interaction: discord.Interaction):
     await interaction.followup.send(f"✅ **Done!** I have successfully left **{left_count}** servers. (Errors: {error_count})\nI am now only active in this server.", ephemeral=True)
 
 @client.tree.command(name="help", description="Show bot commands")
+@cooldown(1, 5)
 async def help_command(interaction: discord.Interaction):
     embed1 = discord.Embed(title="Help - General Commands (Page 1/3)", color=discord.Color.blue())
     embed1.add_field(name="/looking_for_team", value="Post yourself as a Free Agent", inline=False)
@@ -731,8 +618,9 @@ async def help_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed1, view=view, ephemeral=True)
 
 @client.tree.command(name="tm_transfer", description="Transfer Team Ownership to another player")
+@cooldown(1, 5)
 async def tm_transfer(interaction: discord.Interaction, player: discord.Member):
-    g_config = await get_global_config_async(interaction.guild.id)
+    g_config = get_global_config(interaction.guild.id)
     if not g_config:
         return await interaction.response.send_message("❌ Config not set.", ephemeral=True)
     mgr_role_id = g_config[1]
@@ -741,7 +629,7 @@ async def tm_transfer(interaction: discord.Interaction, player: discord.Member):
         return await interaction.response.send_message("❌ Manager role missing from config.", ephemeral=True)
     if mgr_role not in interaction.user.roles:
         return await interaction.response.send_message("❌ You are not a Team Manager.", ephemeral=True)
-    team_info = await find_user_team_async(interaction.user)
+    team_info = find_user_team(interaction.user)
     if not team_info:
         return await interaction.response.send_message("❌ You don't have a team.", ephemeral=True)
     team_role = team_info[0]
@@ -755,6 +643,7 @@ async def tm_transfer(interaction: discord.Interaction, player: discord.Member):
         await interaction.response.send_message(f"❌ Role Error: {e}", ephemeral=True)
 
 @client.tree.command(name="reset_config", description="⚠️ WIPE SERVER DATA (Admin Only)")
+@cooldown(1, 5)
 async def reset_config(interaction: discord.Interaction):
     if not is_staff(interaction):
         return await interaction.response.send_message("❌ Admin Only", ephemeral=True)
@@ -763,59 +652,70 @@ async def reset_config(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 @client.tree.command(name="setup_global", description="Set roles, channels, and limits.")
+@cooldown(1, 5)
 async def setup_global(interaction: discord.Interaction, manager_role: discord.Role, asst_role: discord.Role, free_agent_role: discord.Role, channel: discord.TextChannel, demand_limit: int = 3):
     if not is_staff(interaction):
         return await interaction.response.send_message("❌ Admin Only", ephemeral=True)
-    current_config = await get_global_config_async(interaction.guild.id)
+    current_config = get_global_config(interaction.guild.id)
     window_state = 1
     if current_config and len(current_config) > 5:
         window_state = current_config[5]
-    await set_global_config_async(interaction.guild.id, manager_role.id, asst_role.id, channel.id, free_agent_role.id, window_state, demand_limit)
+    c.execute("INSERT OR REPLACE INTO global_config VALUES (?, ?, ?, ?, ?, ?, ?)",
+              (interaction.guild.id, manager_role.id, asst_role.id, channel.id, free_agent_role.id, window_state, demand_limit))
+    conn.commit()
     await interaction.response.send_message(f"✅ **Config Saved!** (Demand Limit: {demand_limit})", ephemeral=True)
 
 @client.tree.command(name="setup_team", description="Register a Team Role")
+@cooldown(1, 5)
 async def setup_team(interaction: discord.Interaction, team_role: discord.Role, logo: str, roster_limit: int = 20):
     if not is_staff(interaction):
         return await interaction.response.send_message("❌ Admin Only", ephemeral=True)
-    existing = await get_team_data_async(team_role.id)
+    existing = get_team_data(team_role.id)
     trans_img = existing[3] if existing and len(existing) > 3 else None
-    await insert_team_async(team_role.id, logo, roster_limit, trans_img)
+    c.execute("INSERT OR REPLACE INTO teams VALUES (?, ?, ?, ?)", (team_role.id, logo, roster_limit, trans_img))
+    conn.commit()
     await interaction.response.send_message(f"✅ **{team_role.name}** registered!", ephemeral=True)
 
 @client.tree.command(name="team_delete", description="Unregister a team")
+@cooldown(1, 5)
 async def team_delete(interaction: discord.Interaction, team_role: discord.Role):
     if not is_staff(interaction):
         return await interaction.response.send_message("❌ Admin Only", ephemeral=True)
-    await delete_team_async(team_role.id)
+    c.execute("DELETE FROM teams WHERE team_role_id = ?", (team_role.id,))
+    conn.commit()
     await interaction.response.send_message(f"🗑️ **{team_role.name}** removed.", ephemeral=True)
 
 @client.tree.command(name="window", description="Open/Close Window")
 @app_commands.choices(status=[app_commands.Choice(name="Open ✅", value=1), app_commands.Choice(name="Closed ❌", value=0)])
+@cooldown(1, 5)
 async def window(interaction: discord.Interaction, status: int):
     if not is_staff(interaction):
         return await interaction.response.send_message("❌ Admin Only", ephemeral=True)
-    await update_window_async(interaction.guild.id, status)
+    c.execute("UPDATE global_config SET window_open = ? WHERE guild_id = ?", (status, interaction.guild.id))
+    conn.commit()
     msg = "✅ **Transfer Window OPEN!**" if status == 1 else "❌ **Transfer Window CLOSED!**"
     await interaction.response.send_message(msg)
-    conf = await get_global_config_async(interaction.guild.id)
+    conf = get_global_config(interaction.guild.id)
     if conf and conf[3]:
         chan = interaction.guild.get_channel(conf[3])
         if chan:
             await chan.send(msg)
 
 @client.tree.command(name="decorate_transactions", description="Set custom contract background (Upload Image OR Link)")
+@cooldown(1, 5)
 async def decorate_transactions(interaction: discord.Interaction, image_file: discord.Attachment = None, url: str = None):
-    g_config = await get_global_config_async(interaction.guild.id)
+    g_config = get_global_config(interaction.guild.id)
     user_roles = [r.id for r in interaction.user.roles]
     if (g_config[1] not in user_roles) and (g_config[2] not in user_roles) and not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message("❌ Managers or Admins only.", ephemeral=True)
-    team_info = await find_user_team_async(interaction.user)
+    team_info = find_user_team(interaction.user)
     if not team_info:
         return await interaction.response.send_message("❌ You aren't managing a team.", ephemeral=True)
     team_role, _, _, _ = team_info
     final_url = None
     if url and url.lower() in ["reset", "none", "remove"]:
-        await update_team_transaction_image_async(team_role.id, None)
+        c.execute("UPDATE teams SET transaction_image = NULL WHERE team_role_id = ?", (team_role.id,))
+        conn.commit()
         return await interaction.response.send_message(f"✅ **{team_role.name}** reverted to Proxima Default.")
     if image_file:
         if not image_file.content_type.startswith("image/"):
@@ -827,33 +727,35 @@ async def decorate_transactions(interaction: discord.Interaction, image_file: di
         final_url = url
     else:
         return await interaction.response.send_message("❌ Provide an **Image File** OR a **URL**.", ephemeral=True)
-    await update_team_transaction_image_async(team_role.id, final_url)
+    c.execute("UPDATE teams SET transaction_image = ? WHERE team_role_id = ?", (final_url, team_role.id))
+    conn.commit()
     embed = discord.Embed(title="Background Updated", description="Your future signings will look like this:", color=discord.Color.green())
     embed.set_image(url=final_url)
     await interaction.response.send_message(f"✅ **{team_role.name}** custom background set!", embed=embed, ephemeral=True)
 
 @client.tree.command(name="sign", description="Sign a player to YOUR team")
+@cooldown(1, 5)
 async def sign(interaction: discord.Interaction, player: discord.Member):
     await interaction.response.defer()
-    if not await is_window_open_async(interaction.guild.id):
+    if not is_window_open(interaction.guild.id):
         return await interaction.followup.send("❌ **Window Closed.**")
-    g_config = await get_global_config_async(interaction.guild.id)
+    g_config = get_global_config(interaction.guild.id)
     user_roles = [r.id for r in interaction.user.roles]
     if (g_config[1] not in user_roles) and (g_config[2] not in user_roles):
         return await interaction.followup.send("❌ Not Authorized.")
-    team_info = await find_user_team_async(interaction.user)
+    team_info = find_user_team(interaction.user)
     if not team_info:
         return await interaction.followup.send("❌ No team role.")
     team_role, logo, limit, custom_bg = team_info
     if team_role in player.roles:
         return await interaction.followup.send("⚠️ Already on team.")
-    if await find_user_team_async(player):
+    if find_user_team(player):
         return await interaction.followup.send("🚫 Player on another team. Use `/transfer`.")
     if len(team_role.members) >= limit:
         return await interaction.followup.send("❌ Roster Full!")
     await player.add_roles(team_role)
-    await cleanup_free_agent_async(interaction.guild, player)
-    await update_stat_async(player.id, "transfer")
+    await cleanup_free_agent(interaction.guild, player)
+    update_stat(player.id, "transfer")
     desc = f"The {team_role.mention} have **signed** {player.mention}"
     embed = create_transaction_embed(interaction.guild, f"{team_role.name} Transaction", desc, discord.Color.blue(), team_role, logo, interaction.user, len(team_role.members), limit)
     try:
@@ -867,10 +769,11 @@ async def sign(interaction: discord.Interaction, player: discord.Member):
     await interaction.followup.send("✅ Player Signed!")
 
 @client.tree.command(name="release", description="Release a player")
+@cooldown(1, 5)
 async def release(interaction: discord.Interaction, player: discord.Member):
-    if not await is_window_open_async(interaction.guild.id):
+    if not is_window_open(interaction.guild.id):
         return await interaction.response.send_message("❌ Window Closed.", ephemeral=True)
-    team_info = await find_user_team_async(interaction.user)
+    team_info = find_user_team(interaction.user)
     if not team_info:
         return await interaction.response.send_message("❌ No team.", ephemeral=True)
     team_role, logo, limit, custom_bg = team_info
@@ -889,21 +792,22 @@ async def release(interaction: discord.Interaction, player: discord.Member):
     await interaction.response.send_message("✅ Released!", ephemeral=True)
 
 @client.tree.command(name="demand", description="Leave your current team (Uses Demand Limit)")
+@cooldown(1, 5)
 async def demand(interaction: discord.Interaction):
-    team_info = await find_user_team_async(interaction.user)
+    team_info = find_user_team(interaction.user)
     if not team_info:
         return await interaction.response.send_message("❌ Not in a team.", ephemeral=True)
     team_role, logo, limit, _ = team_info
-    g_conf = await get_global_config_async(interaction.guild.id)
+    g_conf = get_global_config(interaction.guild.id)
     demand_limit = g_conf[6] if g_conf and len(g_conf) > 6 else 3
-    stats = await get_player_stats_async(interaction.user.id)
+    stats = get_player_stats(interaction.user.id)
     demands_used = stats[2]
     if demands_used >= demand_limit:
         return await interaction.response.send_message(f"🚫 **Demand Limit Reached!** ({demands_used}/{demand_limit})\nYou cannot leave your team.", ephemeral=True)
     await interaction.user.remove_roles(team_role)
-    await update_stat_async(interaction.user.id, "demand")
+    update_stat(interaction.user.id, "demand")
     demands_left = demand_limit - (demands_used + 1)
-    config = await get_global_config_async(interaction.guild.id)
+    config = get_global_config(interaction.guild.id)
     if config and config[4]:
         fa_role = interaction.guild.get_role(config[4])
         if fa_role:
@@ -911,18 +815,19 @@ async def demand(interaction: discord.Interaction):
     desc = f"{interaction.user.mention} has **Demanded Release** from the team.\n\n⚠️ **Demands Left:** {demands_left}"
     embed = create_transaction_embed(interaction.guild, "Transfer Demand", desc, discord.Color.dark_grey(), team_role, logo, None, len(team_role.members), limit)
     await send_to_channel(interaction.guild, embed)
-    heads, assts = await get_managers_of_team_async(interaction.guild, team_role)
+    heads, assts = get_managers_of_team(interaction.guild, team_role)
     for mgr in heads + assts:
         await send_dm(mgr, content=f"📢 {interaction.user.name} has left your team.")
     await interaction.response.send_message(f"👋 Left **{team_role.name}**.\nDemands remaining: {demands_left}", ephemeral=True)
 
 @client.tree.command(name="promote", description="Promote a player to Assistant Manager")
+@cooldown(1, 5)
 async def promote(interaction: discord.Interaction, player: discord.Member):
-    g_config = await get_global_config_async(interaction.guild.id)
+    g_config = get_global_config(interaction.guild.id)
     user_roles = [r.id for r in interaction.user.roles]
     if g_config[1] not in user_roles and not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message("❌ Head Managers only.", ephemeral=True)
-    team_info = await find_user_team_async(interaction.user)
+    team_info = find_user_team(interaction.user)
     if not team_info:
         return await interaction.response.send_message("❌ You aren't managing a team.", ephemeral=True)
     team_role = team_info[0]
@@ -936,10 +841,12 @@ async def promote(interaction: discord.Interaction, player: discord.Member):
     await interaction.response.send_message(f"✅ Promoted {player.mention} to **Assistant Manager** of {team_role.name}!")
 
 @client.tree.command(name="transfer_list", description="Show top players by transfer count")
+@cooldown(1, 5)
 async def transfer_list(interaction: discord.Interaction):
     if not is_staff(interaction):
         return await interaction.response.send_message("❌ Admin Only", ephemeral=True)
-    data = await get_top_transfers_async()
+    c.execute("SELECT user_id, transfers FROM player_stats ORDER BY transfers DESC LIMIT 15")
+    data = c.fetchall()
     if not data:
         return await interaction.response.send_message("No transfer history found.", ephemeral=True)
     embed = discord.Embed(title="📊 Most Transfers", color=discord.Color.gold())
@@ -954,9 +861,11 @@ async def transfer_list(interaction: discord.Interaction):
 @client.tree.command(name="looking_for_team", description="Post yourself as a Free Agent")
 @app_commands.choices(region=[app_commands.Choice(name="Asia", value="ASIA"), app_commands.Choice(name="Europe", value="EU"), app_commands.Choice(name="NA", value="NA"), app_commands.Choice(name="SA", value="SA")],
                       position=[app_commands.Choice(name="ST", value="ST"), app_commands.Choice(name="MF", value="MF"), app_commands.Choice(name="DF", value="DF"), app_commands.Choice(name="GK", value="GK")])
+@cooldown(1, 5)
 async def looking_for_team(interaction: discord.Interaction, region: str, position: str, description: str):
-    await insert_free_agent_async(interaction.user.id, region, position, description)
-    config = await get_global_config_async(interaction.guild.id)
+    c.execute("INSERT OR REPLACE INTO free_agents VALUES (?, ?, ?, ?, ?)", (interaction.user.id, region, position, description, str(datetime.datetime.now())))
+    conn.commit()
+    config = get_global_config(interaction.guild.id)
     if config and config[4]:
         role = interaction.guild.get_role(config[4])
         if role:
@@ -964,9 +873,11 @@ async def looking_for_team(interaction: discord.Interaction, region: str, positi
     await interaction.response.send_message(f"✅ Listed as **Free Agent** ({region} - {position})!", ephemeral=True)
 
 @client.tree.command(name="free_agents", description="View available players")
+@cooldown(1, 5)
 async def free_agents(interaction: discord.Interaction):
     await interaction.response.defer()
-    agents = await get_free_agents_async()
+    c.execute("SELECT * FROM free_agents")
+    agents = c.fetchall()
     if not agents:
         return await interaction.followup.send("🤷‍♂️ No Free Agents currently listed.")
     embed = discord.Embed(title="📄 Free Agency Market", color=discord.Color.teal())
@@ -983,14 +894,15 @@ async def free_agents(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed)
 
 @client.tree.command(name="team_list", description="List teams (Admin)")
+@cooldown(1, 5)
 async def team_list(interaction: discord.Interaction):
     if not is_staff(interaction):
         return await interaction.response.send_message("❌ Admin Only", ephemeral=True)
     await interaction.response.defer()
-    g_conf = await get_global_config_async(interaction.guild.id)
+    g_conf = get_global_config(interaction.guild.id)
     mgr_id = g_conf[1] if g_conf else 0
     asst_id = g_conf[2] if g_conf else 0
-    all_teams = await get_all_teams_async()
+    all_teams = get_all_teams()
     if not all_teams:
         return await interaction.followup.send("❌ No teams.")
     embed = discord.Embed(title="🏆 Registered Teams List", color=discord.Color.gold())
@@ -1007,11 +919,12 @@ async def team_list(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed)
 
 @client.tree.command(name="team_view", description="View a specific team's roster")
+@cooldown(1, 5)
 async def team_view(interaction: discord.Interaction, team: discord.Role):
-    data = await get_team_data_async(team.id)
+    data = get_team_data(team.id)
     if not data:
         return await interaction.response.send_message("❌ Not a registered team.", ephemeral=True)
-    g_conf = await get_global_config_async(interaction.guild.id)
+    g_conf = get_global_config(interaction.guild.id)
     mgr_id = g_conf[1] if g_conf else 0
     asst_id = g_conf[2] if g_conf else 0
     logo = data[1]
@@ -1026,20 +939,21 @@ async def team_view(interaction: discord.Interaction, team: discord.Role):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @client.tree.command(name="transfer", description="Request to sign a player")
+@cooldown(1, 5)
 async def transfer(interaction: discord.Interaction, player: discord.Member):
-    if not await is_window_open_async(interaction.guild.id):
+    if not is_window_open(interaction.guild.id):
         return await interaction.response.send_message("❌ **Window CLOSED.**", ephemeral=True)
-    my_team_info = await find_user_team_async(interaction.user)
+    my_team_info = find_user_team(interaction.user)
     if not my_team_info:
         return await interaction.response.send_message("❌ Not a manager.", ephemeral=True)
     my_team_role, my_logo, _, _ = my_team_info
-    target_team_info = await find_user_team_async(player)
+    target_team_info = find_user_team(player)
     if not target_team_info:
         return await interaction.response.send_message("⚠️ Player not on a team.", ephemeral=True)
     target_team_role, _, _, _ = target_team_info
     if my_team_role.id == target_team_role.id:
         return await interaction.response.send_message("⚠️ Already on your team!", ephemeral=True)
-    heads, assts = await get_managers_of_team_async(interaction.guild, target_team_role)
+    heads, assts = get_managers_of_team(interaction.guild, target_team_role)
     target_manager = heads[0] if heads else (assts[0] if assts else None)
     if not target_manager:
         return await interaction.response.send_message(f"❌ **{target_team_role.name}** has no active Manager.", ephemeral=True)
@@ -1052,6 +966,7 @@ async def transfer(interaction: discord.Interaction, player: discord.Member):
         await interaction.response.send_message(f"❌ Could not DM manager.", ephemeral=True)
 
 @client.tree.command(name="test_card", description="TEST: Generates a sample signing card")
+@cooldown(1, 5)
 async def test_card(interaction: discord.Interaction):
     await interaction.response.defer()
     try:
@@ -1066,9 +981,10 @@ async def test_card(interaction: discord.Interaction):
 # --- NEW LOAN COMMANDS ---
 
 @client.tree.command(name="loan", description="Loan a player from your team to another team (3 hours).")
+@cooldown(1, 5)
 async def loan(interaction: discord.Interaction, player: discord.Member, target_team: discord.Role):
     # Check if user is manager/assistant
-    g_config = await get_global_config_async(interaction.guild.id)
+    g_config = get_global_config(interaction.guild.id)
     if not g_config:
         return await interaction.response.send_message("❌ Bot not configured. Run `/setup_global`.", ephemeral=True)
     mgr_role = interaction.guild.get_role(g_config[1])
@@ -1077,13 +993,13 @@ async def loan(interaction: discord.Interaction, player: discord.Member, target_
         return await interaction.response.send_message("❌ You must be a Team Manager or Assistant Manager.", ephemeral=True)
 
     # Find the team of the user
-    team_info = await find_user_team_async(interaction.user)
+    team_info = find_user_team(interaction.user)
     if not team_info:
         return await interaction.response.send_message("❌ You are not on any team.", ephemeral=True)
     from_team = team_info[0]
 
     # Validate target team is registered
-    if not await get_team_data_async(target_team.id):
+    if not get_team_data(target_team.id):
         return await interaction.response.send_message("❌ Target team is not registered.", ephemeral=True)
     if from_team.id == target_team.id:
         return await interaction.response.send_message("❌ Cannot loan to your own team.", ephemeral=True)
@@ -1093,19 +1009,19 @@ async def loan(interaction: discord.Interaction, player: discord.Member, target_
         return await interaction.response.send_message("❌ That player is not on your team.", ephemeral=True)
 
     # Check if player is already on loan or in cooldown
-    if await is_player_on_loan_async(player.id):
+    if is_player_on_loan(player.id):
         return await interaction.response.send_message("❌ That player is already on loan.", ephemeral=True)
-    if await is_player_in_cooldown_async(player.id):
+    if is_player_in_cooldown(player.id):
         return await interaction.response.send_message("❌ That player is still in cooldown (24h after last loan).", ephemeral=True)
 
     # Check loan limit for source team
-    limit = await get_team_loan_limit_async(from_team.id)
-    active = await get_active_loans_for_team_async(from_team.id)
+    limit = get_team_loan_limit(from_team.id)
+    active = get_active_loans_for_team(from_team.id)
     if active >= limit:
         return await interaction.response.send_message(f"❌ Your team already has {active}/{limit} active loans.", ephemeral=True)
 
     # Send confirmation to target team's managers
-    heads, assts = await get_managers_of_team_async(interaction.guild, target_team)
+    heads, assts = get_managers_of_team(interaction.guild, target_team)
     target_manager = heads[0] if heads else (assts[0] if assts else None)
     if not target_manager:
         return await interaction.response.send_message(f"❌ **{target_team.name}** has no active Manager.", ephemeral=True)
@@ -1120,9 +1036,10 @@ async def loan(interaction: discord.Interaction, player: discord.Member, target_
         await interaction.response.send_message(f"❌ Could not DM the manager of {target_team.name}.", ephemeral=True)
 
 @client.tree.command(name="loan_cancel", description="Cancel a loan you initiated.")
+@cooldown(1, 5)
 async def loan_cancel(interaction: discord.Interaction, player: discord.Member):
     # Check manager/assistant
-    g_config = await get_global_config_async(interaction.guild.id)
+    g_config = get_global_config(interaction.guild.id)
     if not g_config:
         return await interaction.response.send_message("❌ Bot not configured.", ephemeral=True)
     mgr_role = interaction.guild.get_role(g_config[1])
@@ -1131,18 +1048,20 @@ async def loan_cancel(interaction: discord.Interaction, player: discord.Member):
         return await interaction.response.send_message("❌ You must be a Team Manager or Assistant Manager.", ephemeral=True)
 
     # Find active loan for this player
-    row = await get_active_loan_async(player.id)
+    c.execute("SELECT loan_id, from_team_id, to_team_id FROM loans WHERE user_id = ? AND end_time > ?",
+              (player.id, datetime.datetime.now().isoformat()))
+    row = c.fetchone()
     if not row:
         return await interaction.response.send_message("❌ That player is not currently on loan.", ephemeral=True)
     loan_id, from_team_id, to_team_id = row
 
     # Check if the user is from the same team that initiated the loan
-    user_team = await find_user_team_async(interaction.user)
+    user_team = find_user_team(interaction.user)
     if not user_team or user_team[0].id != from_team_id:
         return await interaction.response.send_message("❌ You can only cancel loans that originated from your team.", ephemeral=True)
 
     # Cancel the loan
-    result = await end_loan_async(loan_id)
+    result = end_loan(loan_id)
     if result:
         user_id, from_id, to_id = result
         member = interaction.guild.get_member(user_id)
@@ -1158,14 +1077,15 @@ async def loan_cancel(interaction: discord.Interaction, player: discord.Member):
         await interaction.response.send_message("❌ Could not cancel loan.", ephemeral=True)
 
 @client.tree.command(name="loan_limit", description="[Admin] Set max concurrent loans for a team.")
+@cooldown(1, 5)
 async def loan_limit(interaction: discord.Interaction, team: discord.Role, limit: int = 1):
     if not is_staff(interaction):
         return await interaction.response.send_message("❌ Admin only.", ephemeral=True)
     if limit < 0:
         return await interaction.response.send_message("❌ Limit must be 0 or positive.", ephemeral=True)
-    if not await get_team_data_async(team.id):
+    if not get_team_data(team.id):
         return await interaction.response.send_message("❌ That team is not registered.", ephemeral=True)
-    await set_team_loan_limit_async(team.id, limit)
+    set_team_loan_limit(team.id, limit)
     await interaction.response.send_message(f"✅ Loan limit for **{team.name}** set to {limit}.", ephemeral=True)
 
 # --- ERROR HANDLER ---
@@ -1184,7 +1104,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             pass
 
 # --- STARTUP ---
-print("System: Loading Proxima V17 (Loan System with non-blocking DB)...")
+print("System: Loading Proxima V17 (Loan System with cooldowns)...")
 if TOKEN:
     try:
         keep_alive()
