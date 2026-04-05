@@ -4,7 +4,7 @@ import sqlite3
 import datetime
 import os
 import asyncio
-import functools
+import concurrent.futures
 from keep_alive import keep_alive
 
 # --- IMPORTS FOR IMAGE GENERATION ---
@@ -30,30 +30,35 @@ def check_and_download_font():
 
 check_and_download_font()
 
-# --- DATABASE HELPER (non-blocking) ---
-def run_db(func, *args, **kwargs):
-    """Run a database function in a thread pool with a fresh connection."""
-    async def wrapper():
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None,
-            lambda: db_worker(func, *args, **kwargs)
-        )
-    return wrapper
+# --- OPTIMISED DATABASE HANDLER (single connection + thread pool) ---
+class Database:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.lock = asyncio.Lock()
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
-def db_worker(func, *args, **kwargs):
-    """Worker that creates a new connection, runs the query, and closes it."""
-    conn = sqlite3.connect('team_manager.db')
-    c = conn.cursor()
-    try:
-        result = func(c, *args, **kwargs)
-        conn.commit()
-        return result
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        conn.close()
+    async def run(self, func, *args, **kwargs):
+        async with self.lock:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                self.executor,
+                lambda: self._worker(func, *args, **kwargs)
+            )
+
+    def _worker(self, func, *args, **kwargs):
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
+        c = conn.cursor()
+        try:
+            result = func(c, *args, **kwargs)
+            conn.commit()
+            return result
+        except Exception as e:
+            conn.rollback()
+            raise e
+        finally:
+            conn.close()
+
+db = Database('team_manager.db')
 
 # --- DATABASE QUERY FUNCTIONS (synchronous, expecting cursor as first argument) ---
 def init_db(c):
@@ -84,7 +89,6 @@ def init_db(c):
                  transfers INTEGER DEFAULT 0,
                  demands INTEGER DEFAULT 0
                  )""")
-    # Migrations
     for col in ["free_agent_role_id", "window_open", "demand_limit"]:
         try:
             c.execute(f"ALTER TABLE global_config ADD COLUMN {col} INTEGER")
@@ -156,51 +160,51 @@ def get_top_transfers(c):
 
 # --- ASYNC WRAPPERS ---
 async def init_db_async():
-    await run_db(init_db)()
+    await db.run(init_db)
 
 async def get_global_config_async(guild_id):
-    return await run_db(get_global_config, guild_id)()
+    return await db.run(get_global_config, guild_id)
 
 async def get_team_data_async(role_id):
-    return await run_db(get_team_data, role_id)()
+    return await db.run(get_team_data, role_id)
 
 async def get_all_teams_async():
-    return await run_db(get_all_teams)()
+    return await db.run(get_all_teams)
 
 async def get_player_stats_async(user_id):
-    return await run_db(get_player_stats, user_id)()
+    return await db.run(get_player_stats, user_id)
 
 async def update_stat_async(user_id, stat_type, amount=1):
-    await run_db(update_stat, user_id, stat_type, amount)()
+    await db.run(update_stat, user_id, stat_type, amount)
 
 async def delete_free_agent_async(user_id):
-    await run_db(delete_free_agent, user_id)()
+    await db.run(delete_free_agent, user_id)
 
 async def insert_free_agent_async(user_id, region, position, description):
-    await run_db(insert_free_agent, user_id, region, position, description)()
+    await db.run(insert_free_agent, user_id, region, position, description)
 
 async def get_free_agents_async():
-    return await run_db(get_free_agents)()
+    return await db.run(get_free_agents)
 
 async def set_global_config_async(guild_id, manager_id, asst_id, channel_id, fa_role_id, window_state, demand_limit):
-    await run_db(set_global_config, guild_id, manager_id, asst_id, channel_id, fa_role_id, window_state, demand_limit)()
+    await db.run(set_global_config, guild_id, manager_id, asst_id, channel_id, fa_role_id, window_state, demand_limit)
 
 async def update_window_async(guild_id, status):
-    await run_db(update_window, guild_id, status)()
+    await db.run(update_window, guild_id, status)
 
 async def insert_team_async(team_role_id, logo, roster_limit, trans_img):
-    await run_db(insert_team, team_role_id, logo, roster_limit, trans_img)()
+    await db.run(insert_team, team_role_id, logo, roster_limit, trans_img)
 
 async def delete_team_async(team_role_id):
-    await run_db(delete_team, team_role_id)()
+    await db.run(delete_team, team_role_id)
 
 async def update_team_transaction_image_async(team_role_id, image_url):
-    await run_db(update_team_transaction_image, team_role_id, image_url)()
+    await db.run(update_team_transaction_image, team_role_id, image_url)
 
 async def get_top_transfers_async():
-    return await run_db(get_top_transfers)()
+    return await db.run(get_top_transfers)
 
-# --- HELPER FUNCTIONS (async) ---
+# --- HELPER FUNCTIONS ---
 def is_staff(interaction: discord.Interaction):
     return interaction.user.guild_permissions.administrator
 
@@ -276,7 +280,7 @@ async def generate_transaction_card(player, team_name, team_color, title_text="O
                         draw_overlay = ImageDraw.Draw(overlay)
                         draw_overlay.rectangle([(0, 240), (W, H)], fill=(0, 0, 0, 160))
                         img.paste(overlay, (0, 0), mask=overlay)
-        except (asyncio.TimeoutError, aiohttp.ClientError, Exception):
+        except:
             img = None
 
     if img is None and os.path.exists(DEFAULT_BG_FILE):
@@ -307,7 +311,7 @@ async def generate_transaction_card(player, team_name, team_color, title_text="O
                     draw_mask.ellipse((0, 0, 200, 200), fill=255)
                     img.paste(avatar, (300, 50), mask=mask)
                     draw.ellipse((300, 50, 500, 250), outline="white", width=3)
-    except (asyncio.TimeoutError, aiohttp.ClientError, Exception):
+    except:
         pass
 
     try:
@@ -444,7 +448,7 @@ class ResetView(discord.ui.View):
 
     @discord.ui.button(label="⚠️ CONFIRM WIPE", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await run_db(lambda c: c.execute("DELETE FROM global_config WHERE guild_id = ?", (self.guild_id,)))()
+        await db.run(lambda c: c.execute("DELETE FROM global_config WHERE guild_id = ?", (self.guild_id,)))
         await interaction.response.edit_message(content="✅ **Configuration Wiped.** Please run `/setup_global` again.", view=None, embed=None)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
@@ -464,15 +468,16 @@ class LeagueBot(discord.Client):
 
 client = LeagueBot()
 
-# --- COMMANDS (with cooldowns and defer) ---
-
+# --- COMMANDS ---
 def cooldown(rate=1, per=5):
     return app_commands.checks.cooldown(rate, per)
 
-# Owner-only command – no cooldown needed, but we add defer for safety
+@client.tree.command(name="ping", description="Check if the bot is responsive")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message("Pong! 🏓 Bot is alive and responsive.", ephemeral=True)
+
 @client.tree.command(name="leave_other_servers", description="[OWNER ONLY] Makes the bot leave all other servers.")
 async def leave_other_servers(interaction: discord.Interaction):
-    # Defer immediately to avoid timeout
     await interaction.response.defer(ephemeral=True)
     OWNER_ID = 925817680848617486
     if interaction.user.id != OWNER_ID:
@@ -495,13 +500,13 @@ async def leave_other_servers(interaction: discord.Interaction):
 @client.tree.command(name="help", description="Show bot commands")
 @cooldown(1, 5)
 async def help_command(interaction: discord.Interaction):
-    # This command is fast, but we still defer to be safe
     await interaction.response.defer(ephemeral=True)
     embed1 = discord.Embed(title="Help - General Commands (Page 1/3)", color=discord.Color.blue())
     embed1.add_field(name="/looking_for_team", value="Post yourself as a Free Agent", inline=False)
     embed1.add_field(name="/demand", value="Leave your current team (Uses Demand Limit)", inline=False)
     embed1.add_field(name="/team_view [role]", value="View a team's roster", inline=False)
     embed1.add_field(name="/free_agents", value="View available players", inline=False)
+    embed1.add_field(name="/ping", value="Check if the bot is responsive", inline=False)
 
     embed2 = discord.Embed(title="Help - Manager Commands (Page 2/3)", color=discord.Color.green())
     embed2.add_field(name="/sign [player]", value="Sign a player to your team", inline=False)
@@ -903,7 +908,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             pass
 
 # --- STARTUP ---
-print("System: Loading Proxima V17 (Non-blocking DB with defer)...")
+print("System: Loading Proxima V17 (Optimised DB + ping)...")
 if TOKEN:
     try:
         keep_alive()
