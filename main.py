@@ -17,6 +17,12 @@ import urllib.request
 TOKEN = os.environ.get('TOKEN')
 DEFAULT_BG_FILE = "proxima_default.jpg"
 
+# ==================================================
+# 🔁 REPLACE THIS WITH YOUR DISCORD SERVER ID
+# Enable Developer Mode → right‑click server → Copy ID
+GUILD_ID = 1429163199332221103   # <-- CHANGE THIS
+# ==================================================
+
 # --- AUTO-DOWNLOAD FONT (Bebas Neue) ---
 def check_and_download_font():
     if not os.path.exists("font.ttf"):
@@ -30,7 +36,7 @@ def check_and_download_font():
 
 check_and_download_font()
 
-# --- OPTIMISED DATABASE HANDLER (single connection + thread pool) ---
+# --- OPTIMISED DATABASE HANDLER ---
 class Database:
     def __init__(self, db_path):
         self.db_path = db_path
@@ -60,7 +66,7 @@ class Database:
 
 db = Database('team_manager.db')
 
-# --- DATABASE QUERY FUNCTIONS (synchronous, expecting cursor as first argument) ---
+# --- DATABASE QUERY FUNCTIONS ---
 def init_db(c):
     c.execute("""CREATE TABLE IF NOT EXISTS global_config (
                  guild_id INTEGER PRIMARY KEY,
@@ -455,7 +461,7 @@ class ResetView(discord.ui.View):
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="❌ **Reset Cancelled.**", view=None, embed=None)
 
-# --- BOT CLASS ---
+# --- BOT CLASS (with guild‑specific sync) ---
 class LeagueBot(discord.Client):
     def __init__(self):
         super().__init__(intents=discord.Intents.all())
@@ -463,12 +469,34 @@ class LeagueBot(discord.Client):
 
     async def on_ready(self):
         await init_db_async()
-        await self.tree.sync()
+        # Wait a few seconds to avoid hitting rate limits
+        await asyncio.sleep(5)
+
+        # Sync only to your server
+        guild = discord.Object(id=GUILD_ID)
+        self.tree.copy_global_to(guild=guild)
+
+        # Retry up to 5 times with exponential backoff
+        for attempt in range(5):
+            try:
+                await self.tree.sync(guild=guild)
+                print(f"✅ Commands synced to guild {GUILD_ID} (attempt {attempt+1})")
+                break
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    wait = 2 ** (attempt + 1)  # 2, 4, 8, 16, 32 seconds
+                    print(f"⚠️ Rate limited during sync. Retrying in {wait}s...")
+                    await asyncio.sleep(wait)
+                else:
+                    raise
+        else:
+            print("❌ Failed to sync commands after 5 attempts.")
+
         print(f"✅ LOGGED IN AS: {self.user}")
 
 client = LeagueBot()
 
-# --- COMMANDS ---
+# --- COMMANDS (unchanged, only cooldown is 5 seconds) ---
 def cooldown(rate=1, per=5):
     return app_commands.checks.cooldown(rate, per)
 
@@ -908,7 +936,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
             pass
 
 # --- STARTUP ---
-print("System: Loading Proxima V17 (Optimised DB + ping)...")
+print("System: Loading Proxima V17 (Guild‑specific sync)...")
 if TOKEN:
     try:
         keep_alive()
