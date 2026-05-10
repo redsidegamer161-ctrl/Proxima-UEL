@@ -20,7 +20,7 @@ DEFAULT_BG_FILE = "proxima_default.jpg"
 # ==================================================
 # 🔁 REPLACE THIS WITH YOUR DISCORD SERVER ID
 # Enable Developer Mode → right‑click server → Copy ID
-GUILD_ID = 1429163199332221103   # <-- CHANGE THIS
+GUILD_ID = 1456574786351136770   # <-- CHANGE THIS
 # ==================================================
 
 # --- AUTO-DOWNLOAD FONT (Bebas Neue) ---
